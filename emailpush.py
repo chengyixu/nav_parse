@@ -2,23 +2,25 @@
 # -*- coding: utf-8 -*-
 """
 Fund-NAV harvester v0.9.3 (LLM-focused, incremental processing, improved parsing & prompt)
+Streamlit Enhanced Version - Chinese UI
 ───────────────────────────────────────────────────────────────────────────
-1. IMAP login (163.com, ID handshake)
-2. Read last run timestamp.
-3. For each new message (since last run):
+1. Streamlit UI for interaction and display (Chinese).
+2. IMAP login (163.com, ID handshake)
+3. Read last run timestamp.
+4. On button click, for each new message (since last run):
      • capture subject + sender + full body text
      • capture every attachment (any filename)
      • send ⟨subject + body + attachment text⟩ to GLM-Z1-Flash
-4. Parse LLM's JSON response & write rows → YYYY-MM-DD 基金净值.xlsx
-5. Save current run timestamp.
+5. Parse LLM's JSON response & write rows → 年-月-日 基金净值.xlsx (local save & download)
+6. Save current run timestamp.
 """
 
+import streamlit as st
 import re, json, tempfile, pathlib, datetime, contextlib, io, warnings
 from imapclient import IMAPClient
 import pyzmail, pandas as pd, requests
-from tqdm import tqdm
 
-# optional, nicer HTML-to-text if bs4 is around
+# Optional, nicer HTML-to-text if bs4 is around
 try:
     from bs4 import BeautifulSoup
     def html2text(html:str)->str:
@@ -28,44 +30,58 @@ except ImportError:
         return re.sub(r"<[^>]+>", "", html)
 
 warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl")
+warnings.filterwarnings("ignore", category=SyntaxWarning, module="pyzmail.utils") # Ignore SyntaxWarning from pyzmail
+warnings.filterwarnings("ignore", category=SyntaxWarning, module="pyzmail.parse") # Ignore SyntaxWarning from pyzmail
 
 # ─── creds & endpoints ──────────────────────────────────────────────────
 IMAP_HOST  = "imap.163.com"
-EMAIL_USER = "zhanluekehu@163.com" # Replace with your actual email
-EMAIL_PWD  = "DRqdN38whrnCFPGx"    # Replace with your actual 163 App Authorization Code
-GLM_KEY    = "afe7583d73c9d3948f60230e79e08151.Z9HPB84mxuC31DeK" # Replace with your actual GLM API Key
+EMAIL_USER = "zhanluekehu@163.com" # 请替换为您的实际邮箱
+EMAIL_PWD  = "DRqdN38whrnCFPGx"    # 请替换为您的实际163邮箱应用授权码
+GLM_KEY    = "afe7583d73c9d3948f60230e79e08151.Z9HPB84mxuC31DeK" # 请替换为您的实际GLM API Key
 GLM_URL    = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
-MODEL      = "glm-z1-flash" # Or your preferred model like "glm-4", "glm-3-turbo"
+MODEL      = "glm-z1-flash" # 或者您偏好的模型，如 "glm-4", "glm-3-turbo"
 # ─────────────────────────────────────────────────────────────────────────
 
-TODAY   = datetime.date.today().strftime("%Y-%m-%d") # Used for default Excel sheet name
-XLSX    = f"{TODAY} 基金净值.xlsx" # Output Excel filename uses current date
-SHEET   = TODAY # Sheet name is current date
+TODAY   = datetime.date.today().strftime("%Y-%m-%d") # 用于默认Excel工作表名称
+XLSX    = f"{TODAY} 基金净值.xlsx" # 输出Excel文件名使用当前日期
+SHEET   = TODAY # 工作表名称是当前日期
 COLS    = ["日期","基金名称","基金代码","单位净值","累计净值",
            "原邮件名","发件人","发件机构"]
 
 # ─── Timestamp logging for incremental processing ─────────────────────
 LOG_DIR = pathlib.Path("log")
 LAST_RUN_FILE = LOG_DIR / "last_run.txt"
-DATETIME_FORMAT = "%Y-%m-%d %H:%M:%S" # UTC datetime format for the log file
+DATETIME_FORMAT = "%Y-%m-%d %H:%M:%S" # 用于日志文件的UTC日期时间格式
+
+# Initialize session state variables
+if 'processing_log' not in st.session_state:
+    st.session_state.processing_log = []
+if 'processed_df' not in st.session_state:
+    st.session_state.processed_df = None
+if 'run_summary' not in st.session_state:
+    st.session_state.run_summary = {}
+
+def append_log(message, level="info"):
+    timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+    st.session_state.processing_log.append(f"[{timestamp}] {message}")
+    # UI display of these logs will be handled by the expander later
 
 def get_last_run_datetime() -> datetime.datetime | None:
     """Reads the last successful run datetime from the log file (expects UTC)."""
     if not LAST_RUN_FILE.exists():
-        print("ℹ️ Last run timestamp file not found. Processing with default window.")
+        append_log("未找到上次运行时间戳文件。将使用默认时间窗口进行处理。", "info")
         return None
     try:
         content = LAST_RUN_FILE.read_text().strip()
         if not content:
-            print("ℹ️ Last run timestamp file is empty. Processing with default window.")
+            append_log("上次运行时间戳文件为空。将使用默认时间窗口进行处理。", "info")
             return None
         dt_naive = datetime.datetime.strptime(content, DATETIME_FORMAT)
-        # Assume stored time is UTC, make it timezone-aware
         dt_utc = dt_naive.replace(tzinfo=datetime.timezone.utc)
-        print(f"ℹ️ Previous run timestamp: {dt_utc.strftime(DATETIME_FORMAT)} UTC")
+        append_log(f"上次运行时间戳: {dt_utc.strftime(DATETIME_FORMAT)} UTC", "info")
         return dt_utc
     except (ValueError, OSError) as e:
-        print(f"⚠️ Error reading or parsing last run timestamp from {LAST_RUN_FILE}: {e}. Processing with default window.")
+        append_log(f"读取或解析上次运行时间戳文件 {LAST_RUN_FILE} 失败: {e}。将使用默认时间窗口进行处理。", "warning")
         return None
 
 def save_current_run_datetime():
@@ -74,84 +90,107 @@ def save_current_run_datetime():
         LOG_DIR.mkdir(parents=True, exist_ok=True)
         now_utc = datetime.datetime.now(datetime.timezone.utc)
         LAST_RUN_FILE.write_text(now_utc.strftime(DATETIME_FORMAT))
-        print(f"☑️ Saved current run timestamp: {now_utc.strftime(DATETIME_FORMAT)} UTC to {LAST_RUN_FILE}")
+        append_log(f"已保存当前运行时间戳: {now_utc.strftime(DATETIME_FORMAT)} UTC 至 {LAST_RUN_FILE}", "info")
+        st.session_state.current_run_timestamp_display = f"{now_utc.strftime(DATETIME_FORMAT)} UTC"
     except OSError as e:
-        print(f"⚠️ Could not save current run timestamp to {LAST_RUN_FILE}: {e}")
+        append_log(f"无法保存当前运行时间戳至 {LAST_RUN_FILE}: {e}", "warning")
 
 # ─── helper: fetch mail (modified for incremental processing) ───────────
-def fetch_mail(last_run_utc_dt: datetime.datetime | None = None, default_days_lookback: int = 30):
+def fetch_mail(last_run_utc_dt: datetime.datetime | None = None, default_days_lookback: int = 30, progress_bar=None, status_text=None):
     """
-    Fetches emails. If last_run_utc_dt is provided, fetches emails SINCE that date
-    and then filters by time. Otherwise, fetches emails from default_days_lookback.
-    Yields pyzmail.PyzMessage objects.
+    Fetches emails. Yields pyzmail.PyzMessage objects.
+    Uses Streamlit elements for progress updates.
     """
-    with IMAPClient(IMAP_HOST, ssl=True) as srv:
-        srv.login(EMAIL_USER, EMAIL_PWD)
-        try:
-            srv.id_({"name":"python","version":"0.9.3","vendor":"myclient", # Updated version
-                     "contact":EMAIL_USER})
-        except Exception:
-            pass # Optional, continue if ID command fails
-        
-        srv.select_folder("INBOX")
-        
-        search_description = ""
-        using_last_run_filter = False
-
-        if last_run_utc_dt:
-            # IMAP SINCE uses date part. Server returns all emails on or after this date.
-            # Time-based filtering will be done client-side using INTERNALDATE.
-            # Ensure last_run_utc_dt is UTC-aware for comparison.
-            if last_run_utc_dt.tzinfo is None or last_run_utc_dt.tzinfo.utcoffset(last_run_utc_dt) is None:
-                last_run_utc_dt = last_run_utc_dt.replace(tzinfo=datetime.timezone.utc)
-
-            since_date_for_imap = last_run_utc_dt.date()
-            search_criteria = ["SINCE", since_date_for_imap]
-            search_description = (f"candidates since {last_run_utc_dt.strftime(DATETIME_FORMAT)} UTC "
-                                  f"(server search from date: {since_date_for_imap.strftime('%Y-%m-%d')})")
-            using_last_run_filter = True
-        else:
-            # Fallback to default lookback period if no last run timestamp
-            since_date_for_imap = (datetime.datetime.now(datetime.timezone.utc).date() - 
-                                   datetime.timedelta(days=default_days_lookback))
-            search_criteria = ["SINCE", since_date_for_imap] # imapclient handles date obj
-            search_description = (f"candidates from last {default_days_lookback} days "
-                                  f"(server search from date: {since_date_for_imap.strftime('%Y-%m-%d')})")
-
-        ids = srv.search(search_criteria)
-        print(f"📬 Found {len(ids)} email {search_description}.")
-        
-        if not ids:
-            print("No emails matched server-side criteria.\n")
-            return
-
-        for mid in tqdm(ids, desc="Fetching & Filtering", unit="mail", mininterval=0.5, bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]'):
-            raw_email_data_map = srv.fetch([mid], ["RFC822", "INTERNALDATE"])
+    try:
+        with IMAPClient(IMAP_HOST, ssl=True) as srv:
+            srv.login(EMAIL_USER, EMAIL_PWD)
+            try:
+                srv.id_({"name":"python-streamlit","version":"0.9.3","vendor":"myclient",
+                         "contact":EMAIL_USER})
+            except Exception:
+                pass
             
-            if not raw_email_data_map or mid not in raw_email_data_map:
-                tqdm.write(f"Warning: Could not fetch full data for message ID {mid}")
-                continue 
+            srv.select_folder("INBOX")
             
-            message_data = raw_email_data_map[mid]
+            search_description_text = ""
+            using_last_run_filter = False
 
-            if b"RFC822" not in message_data:
-                tqdm.write(f"Warning: Could not fetch RFC822 (body) for message ID {mid}")
-                continue
+            if last_run_utc_dt:
+                if last_run_utc_dt.tzinfo is None or last_run_utc_dt.tzinfo.utcoffset(last_run_utc_dt) is None:
+                    last_run_utc_dt = last_run_utc_dt.replace(tzinfo=datetime.timezone.utc)
+                since_date_for_imap = last_run_utc_dt.date()
+                search_criteria = ["SINCE", since_date_for_imap]
+                search_description_text = (f"自 {last_run_utc_dt.strftime(DATETIME_FORMAT)} UTC "
+                                      f"(服务器搜索起始日期: {since_date_for_imap.strftime('%Y-%m-%d')})")
+                using_last_run_filter = True
+            else:
+                since_date_for_imap = (datetime.datetime.now(datetime.timezone.utc).date() - 
+                                       datetime.timedelta(days=default_days_lookback))
+                search_criteria = ["SINCE", since_date_for_imap]
+                search_description_text = (f"最近 {default_days_lookback} 天 "
+                                      f"(服务器搜索起始日期: {since_date_for_imap.strftime('%Y-%m-%d')})")
 
-            if using_last_run_filter:
-                internal_date_from_server = message_data.get(b'INTERNALDATE') # datetime obj from imapclient
+            ids = srv.search(search_criteria)
+            append_log(f"发现 {len(ids)} 封候选邮件 ({search_description_text})。", "info")
+            st.session_state.run_summary['emails_found_server'] = len(ids)
+            
+            if not ids:
+                append_log("没有邮件符合服务器端条件。", "info")
+                if progress_bar: progress_bar.progress(1.0)
+                if status_text: status_text.text("服务器上未找到符合条件的邮件。")
+                return
+
+            fetched_count = 0
+            for i, mid in enumerate(ids):
+                if progress_bar: progress_bar.progress((i + 1) / len(ids))
+                if status_text: status_text.text(f"正在获取和筛选: {i+1}/{len(ids)}")
                 
-                if internal_date_from_server:
-                    if internal_date_from_server.tzinfo is None or \
-                       internal_date_from_server.tzinfo.utcoffset(internal_date_from_server) is None:
-                        internal_date_from_server = internal_date_from_server.replace(tzinfo=datetime.timezone.utc)
-                    
-                    if internal_date_from_server <= last_run_utc_dt:
-                        continue 
-                else:
-                    tqdm.write(f"Warning: Message ID {mid} missing INTERNALDATE. Cannot filter by exact time. Processing due to date match.")
+                try:
+                    raw_email_data_map = srv.fetch([mid], ["RFC822", "INTERNALDATE"])
+                except imaplib.IMAP4.abort as e_abort: # type: ignore
+                    append_log(f"获取邮件ID {mid} 期间发生IMAP中止错误: {e_abort}", "error")
+                    raise 
+                except Exception as e_fetch:
+                    append_log(f"获取邮件ID {mid} 失败: {e_fetch}", "error")
+                    continue 
 
-            yield pyzmail.PyzMessage.factory(message_data[b"RFC822"])
+                if not raw_email_data_map or mid not in raw_email_data_map:
+                    append_log(f"警告: 无法获取邮件ID {mid} 的完整数据", "warning")
+                    continue 
+                
+                message_data = raw_email_data_map[mid]
+
+                if b"RFC822" not in message_data:
+                    append_log(f"警告: 无法获取邮件ID {mid} 的RFC822 (正文)", "warning")
+                    continue
+
+                if using_last_run_filter and last_run_utc_dt: 
+                    internal_date_from_server = message_data.get(b'INTERNALDATE')
+                    
+                    if internal_date_from_server:
+                        if internal_date_from_server.tzinfo is None or \
+                           internal_date_from_server.tzinfo.utcoffset(internal_date_from_server) is None:
+                            internal_date_from_server = internal_date_from_server.replace(tzinfo=datetime.timezone.utc)
+                        
+                        if internal_date_from_server <= last_run_utc_dt:
+                            continue 
+                    else:
+                        append_log(f"警告: 邮件ID {mid} 缺少INTERNALDATE。无法按确切时间筛选，将基于日期匹配进行处理。", "warning")
+                
+                fetched_count += 1
+                yield pyzmail.PyzMessage.factory(message_data[b"RFC822"])
+            
+            st.session_state.run_summary['emails_to_process_client'] = fetched_count
+            append_log(f"客户端筛选后，总共获取待处理邮件数: {fetched_count}", "info")
+
+    except (imaplib.IMAP4.abort, ConnectionResetError) as e: # type: ignore
+        append_log(f"IMAP连接错误: {e}。请检查网络或凭据后重试。", "error")
+        raise 
+    except Exception as e:
+        append_log(f"邮件获取过程中发生意外错误: {e}", "error")
+        import traceback
+        st.session_state.processing_log.append(traceback.format_exc())
+        raise 
 
 # ─── helper: full body text ─────────────────────────────────────────────
 def get_body(msg):
@@ -175,7 +214,7 @@ def list_attachments(msg):
                 try:
                     payload_bytes = str(payload_bytes).encode(charset, "ignore")
                 except Exception as e:
-                    print(f"    ⚠️ Could not encode attachment '{fn}' payload to bytes: {e}. Skipping.")
+                    append_log(f"    无法将附件 '{fn}' 内容编码为字节: {e}。已跳过。", "warning")
                     continue
             yield fn, payload_bytes
 
@@ -220,25 +259,24 @@ def glm(prompt:str)->str:
                     {"role":"system", "content": system_prompt},
                     {"role":"user","content":prompt}],
                 "temperature":0.2,
-                "max_tokens":32000, # Increased as per original example
+                "max_tokens":32000,
                 "stream":False},
             headers={"Authorization":f"Bearer {GLM_KEY}"},
-            timeout=300)
+            timeout=300) 
         res.raise_for_status()
         return res.json()["choices"][0]["message"]["content"]
     except requests.exceptions.RequestException as e:
-        print(f"    ‼️ GLM API request failed: {e}")
+        append_log(f"    GLM API 请求失败: {e}", "error")
         return "[]" 
     except (KeyError, IndexError, json.JSONDecodeError) as e:
         response_text = res.text if 'res' in locals() else "N/A (response object not available)"
-        print(f"    ‼️ GLM API response format unexpected or not valid JSON: {e} - Response: {response_text[:200]}")
+        append_log(f"    GLM API 响应格式异常或非有效JSON: {e} - 响应内容: {response_text[:200]}", "error")
         return "[]"
 
 # ─── helper: parse GLM response ─────────────────────────────────────────
 def parse_glm(txt:str):
     try:
         cleaned_txt = txt.strip()
-
         json_start_index = -1
         first_brace = cleaned_txt.find('{')
         first_bracket = cleaned_txt.find('[')
@@ -252,16 +290,10 @@ def parse_glm(txt:str):
         
         if json_start_index > 0:
             preceding_text = cleaned_txt[:json_start_index]
-            if "<think>" in preceding_text.lower(): 
-                print(f"    ℹ️ Stripped preceding LLM thought process/text: '{preceding_text[:100].strip()}...'")
-            else:
-                print(f"    ℹ️ Stripped preceding non-JSON text: '{preceding_text[:100].strip()}...'")
+            append_log(f"    已剥离GLM响应中JSON内容之前的文本: '{preceding_text[:100].strip()}...'", "info")
             cleaned_txt = cleaned_txt[json_start_index:]
         elif json_start_index == -1 :
-            if "<think>" in cleaned_txt.lower() :
-                print(f"    ⚠️ GLM output appears to be only thought process/text without JSON: '{cleaned_txt[:200].strip()}...'")
-            else:
-                print(f"    ⚠️ GLM output does not contain valid JSON start character ([ or {{): '{cleaned_txt[:200].strip()}...'")
+            append_log(f"    GLM输出不包含有效的JSON起始字符([或{{)，或者可能仅为思考过程: '{cleaned_txt[:200].strip()}...'", "warning")
             return []
 
         if cleaned_txt.startswith("```json"):
@@ -275,202 +307,290 @@ def parse_glm(txt:str):
             return []
         
         data = json.loads(cleaned_txt)
-        
         parsed_items = []
         expected_keys = {"日期", "基金名称", "基金代码", "单位净值", "累计净值"}
 
-        if isinstance(data, list):
-            for item in data:
-                if isinstance(item, dict) and expected_keys.issubset(item.keys()):
+        items_to_process = data if isinstance(data, list) else [data] if isinstance(data, dict) else []
+        if not items_to_process and data:
+             append_log(f"    GLM输出(剥离后)是有效的JSON，但不是列表或字典格式: {cleaned_txt[:200]}", "warning")
+
+        for item in items_to_process:
+            if isinstance(item, dict):
+                if expected_keys.issubset(item.keys()):
                     try:
-                        item["单位净值"] = float(str(item["单位净值"]).replace(',',''))
-                        item["累计净值"] = float(str(item["累计净值"]).replace(',',''))
+                        item["单位净值"] = float(str(item["单位净值"]).replace(',','')) if item.get("单位净值") is not None else None
+                        item["累计净值"] = float(str(item["累计净值"]).replace(',','')) if item.get("累计净值") is not None else None
                         parsed_items.append(item)
                     except (ValueError, TypeError):
-                        print(f"    ⚠️ GLM list item skipped (net values not convertible to float): {str(item)[:100]}")
-                elif isinstance(item, dict):
-                    print(f"    ⚠️ GLM list item skipped (missing expected keys): {str(item)[:100]}")
+                        append_log(f"    GLM项目已跳过(净值无法转换为浮点数): {str(item)[:100]}", "warning")
                 else:
-                    print(f"    ⚠️ GLM list item skipped (not a dictionary): {str(item)[:100]}")
-            return parsed_items
-        elif isinstance(data, dict): 
-            if expected_keys.issubset(data.keys()):
-                try:
-                    data["单位净值"] = float(str(data["单位净值"]).replace(',',''))
-                    data["累计净值"] = float(str(data["累计净值"]).replace(',',''))
-                    return [data] 
-                except (ValueError, TypeError):
-                    print(f"    ⚠️ GLM dict item skipped (net values not convertible to float): {str(data)[:100]}")
-                    return []
+                    append_log(f"    GLM项目已跳过(缺少预期键): {str(item)[:100]}", "warning")
             else:
-                print(f"    ⚠️ GLM dict skipped (missing expected keys): {str(data)[:100]}")
-                return []
-        else:
-            print(f"    ⚠️ GLM output (after stripping) is valid JSON but not a list or dict: {cleaned_txt[:200]}")
-            return []
+                append_log(f"    GLM项目已跳过(非字典格式): {str(item)[:100]}", "warning")
+        return parsed_items
 
     except json.JSONDecodeError:
-        print(f"    ⚠️ GLM output (after stripping) was not valid JSON. Original start: '{txt[:100].strip()}...'")
+        append_log(f"    GLM输出(剥离后)不是有效的JSON。原始开头: '{txt[:100].strip()}...'", "warning")
         return []
     except Exception as e:
-        print(f"    ⚠️ Unexpected error parsing GLM output: {e}. Original start: '{txt[:100].strip()}...'")
+        append_log(f"    解析GLM输出时发生意外错误: {e}。原始开头: '{txt[:100].strip()}...'", "error")
         return []
 
-# ─── main workflow ──────────────────────────────────────────────────────
-def main():
-    # Ensure log directory exists (also created by save_current_run_datetime if needed)
+# ─── main processing workflow for Streamlit ─────────────────────────────
+def run_processing():
+    st.session_state.processing_log = [] 
+    st.session_state.processed_df = None
+    st.session_state.run_summary = {}
+    
+    append_log("开始处理邮件...", "info")
     LOG_DIR.mkdir(parents=True, exist_ok=True) 
     
-    last_run_dt_utc = get_last_run_datetime()
+    last_run_dt_utc = get_last_run_datetime() 
     
     rows = []
-    # Pass the last run datetime to fetch_mail; default_days_lookback is used if last_run_dt_utc is None
-    mail_fetch_iterator = fetch_mail(last_run_utc_dt=last_run_dt_utc, default_days_lookback=30)
-    
+    progress_bar = st.progress(0.0)
+    status_text = st.empty() 
+
     actual_emails_processed_count = 0
-    if mail_fetch_iterator:
-        for loop_idx, msg in enumerate(mail_fetch_iterator, 1):
-            actual_emails_processed_count = loop_idx 
-            if msg is None: continue
-
-            sender_addresses = msg.get_addresses("from")
-            if sender_addresses:
-                sender_name, sender_email = sender_addresses[0]
-            else:
-                sender_name, sender_email = "Unknown Sender", "unknown@example.com"
-
-            subj = msg.get_subject() or "(No Subject)"
-            body = get_body(msg)
-            atts = list(list_attachments(msg))
-
-            print(f"\n[{actual_emails_processed_count}] Processing: {subj}\n    From: {sender_name} <{sender_email}>\n"
-                  f"    Attachments ({len(atts)}): {[fn for fn,_ in atts]}")
-
-            payloads_to_process = [(None, b"")] 
-            payloads_to_process.extend(atts)
-
-            for fn, blob in payloads_to_process:
-                attach_text = "(无相关文本内容)"
-                source_name = "正文"
-
-                if fn: 
-                    source_name = fn
-                    temp_file_path = None
-                    try:
-                        # Create a temporary file with the correct suffix for pandas to infer type
-                        with tempfile.NamedTemporaryFile(delete=False, suffix=pathlib.Path(fn).suffix) as tmp:
-                            tmp.write(blob)
-                            temp_file_path = tmp.name
-                        
-                        try:
-                            xls_content = pd.read_excel(temp_file_path, sheet_name=None)
-                            if isinstance(xls_content, dict):
-                                combined_df = pd.concat(xls_content.values(), ignore_index=True)
-                            else:
-                                combined_df = xls_content
-                            attach_text = combined_df.to_csv(index=False, header=True)
-                        except Exception:
-                            try:
-                                attach_text = blob.decode("utf-8", "ignore")
-                            except UnicodeDecodeError:
-                                attach_text = blob.decode("gbk", "ignore") 
-                            except Exception:
-                                attach_text = "(二进制文件或无法识别编码)"
-                    except Exception as e_file:
-                        attach_text = f"(附件处理错误: {e_file})"
-                    finally:
-                        if temp_file_path and pathlib.Path(temp_file_path).exists():
-                            pathlib.Path(temp_file_path).unlink()
-                
-                if fn is None: 
-                    prompt_context = f"【邮件正文】\n{body}\n\n"
-                else: 
-                    prompt_context = f"【邮件正文】\n{body}\n\n【附件: {fn}】\n{attach_text}"
-
-                prompt = (
-                    f"邮件主题: {subj}\n"
-                    f"发件人: {sender_name} <{sender_email}>\n\n"
-                    f"{prompt_context}"
-                )
-                
-                ans = glm(prompt)
-                parsed = parse_glm(ans)
-
-                if parsed:
-                    print(f"    ↪ GLM parsed {len(parsed)} row(s) from {source_name}")
-                    for item in parsed:
-                        row = {c: "" for c in COLS}
-                        row.update(item) 
-                        row.update({
-                            "原邮件名": subj,
-                            "发件人": sender_email,
-                            "发件机构": sender_name 
-                        })
-                        rows.append(row)
-                else:
-                    print(f"    ↪ 0 rows parsed (or parsing failed) from {source_name}")
     
-    if actual_emails_processed_count == 0:
-        print("\n👀 No new emails were found and processed in this run.")
+    try:
+        mail_fetch_iterator = fetch_mail(
+            last_run_utc_dt=last_run_dt_utc, 
+            default_days_lookback=30,
+            progress_bar=progress_bar,
+            status_text=status_text
+        )
+        
+        if mail_fetch_iterator:
+            email_processing_status = st.empty()
+            for loop_idx, msg in enumerate(mail_fetch_iterator, 1):
+                actual_emails_processed_count = loop_idx 
+                if msg is None: continue
+
+                sender_addresses = msg.get_addresses("from")
+                if sender_addresses:
+                    sender_name, sender_email = sender_addresses[0]
+                else:
+                    sender_name, sender_email = "未知发件人", "unknown@example.com"
+
+                subj = msg.get_subject() or "(无主题)"
+                body = get_body(msg)
+                atts = list(list_attachments(msg)) 
+
+                log_msg = (f"\n[{actual_emails_processed_count}] 正在处理: {subj}\n"
+                           f"    发件人: {sender_name} <{sender_email}>\n"
+                           f"    附件数 ({len(atts)}): {[fn for fn,_ in atts]}")
+                append_log(log_msg)
+                email_processing_status.text(f"正在分析邮件 {actual_emails_processed_count}: {subj[:50]}...")
+
+                payloads_to_process = [(None, b"")] 
+                payloads_to_process.extend(atts)
+
+                for fn, blob in payloads_to_process:
+                    attach_text = "(无相关文本内容)"
+                    source_name = "正文"
+
+                    if fn: 
+                        source_name = fn
+                        temp_file_path = None
+                        try:
+                            with tempfile.NamedTemporaryFile(delete=False, suffix=pathlib.Path(fn).suffix) as tmp:
+                                tmp.write(blob)
+                                temp_file_path = tmp.name
+                            
+                            try:
+                                xls_content = pd.read_excel(temp_file_path, sheet_name=None)
+                                if isinstance(xls_content, dict):
+                                    combined_df = pd.concat(xls_content.values(), ignore_index=True)
+                                else:
+                                    combined_df = xls_content
+                                attach_text = combined_df.to_csv(index=False, header=True)
+                            except Exception:
+                                try:
+                                    attach_text = blob.decode("utf-8", "ignore")
+                                except UnicodeDecodeError:
+                                    attach_text = blob.decode("gbk", "ignore") 
+                                except Exception:
+                                    attach_text = "(二进制文件或无法识别编码)"
+                        except Exception as e_file:
+                            attach_text = f"(附件处理错误: {e_file})"
+                            append_log(f"    处理附件 {fn} 时出错: {e_file}", "warning")
+                        finally:
+                            if temp_file_path and pathlib.Path(temp_file_path).exists():
+                                pathlib.Path(temp_file_path).unlink()
+                    
+                    prompt_context = f"【邮件正文】\n{body}\n\n"
+                    if fn: 
+                        prompt_context += f"【附件: {fn}】\n{attach_text}"
+
+                    prompt = (
+                        f"邮件主题: {subj}\n"
+                        f"发件人: {sender_name} <{sender_email}>\n\n"
+                        f"{prompt_context}"
+                    )
+                    
+                    ans = glm(prompt) 
+                    parsed = parse_glm(ans) 
+
+                    if parsed:
+                        append_log(f"    GLM从 {source_name} 解析到 {len(parsed)} 行数据", "info")
+                        for item in parsed:
+                            row = {c: "" for c in COLS}
+                            row.update(item) 
+                            row.update({
+                                "原邮件名": subj,
+                                "发件人": sender_email,
+                                "发件机构": sender_name 
+                            })
+                            rows.append(row)
+                    else:
+                        append_log(f"    未能从 {source_name} 解析到数据 (或解析失败)", "info")
+            email_processing_status.text(f"邮件分析完成。已处理 {actual_emails_processed_count} 封新邮件。")
+        
+        if progress_bar: progress_bar.progress(1.0) 
+        if status_text: status_text.empty() 
+
+    except (imaplib.IMAP4.abort, ConnectionResetError) as e_imap: # type: ignore
+        append_log(f"由于连接错误，IMAP处理已中止: {e_imap}", "error")
+        st.session_state.run_summary['error'] = str(e_imap)
         save_current_run_datetime() 
+        return 
+    except Exception as e_main_loop:
+        append_log(f"主处理循环中发生意外错误: {e_main_loop}", "error")
+        st.session_state.run_summary['error'] = str(e_main_loop)
+        import traceback
+        st.session_state.processing_log.append(traceback.format_exc())
+        save_current_run_datetime()
+        return
+
+    st.session_state.run_summary['emails_analyzed_count'] = actual_emails_processed_count
+
+    if actual_emails_processed_count == 0 and not st.session_state.run_summary.get('emails_found_server', 0) > 0:
+        append_log("\n本次运行未在服务器上发现需要处理的邮件。", "info")
+        st.session_state.run_summary['nav_rows_extracted'] = 0
+        save_current_run_datetime() 
+        return
+    elif actual_emails_processed_count == 0 and st.session_state.run_summary.get('emails_found_server', 0) > 0:
+        append_log("\n服务器上找到邮件，但没有自上次运行以来的新邮件。", "info")
+        st.session_state.run_summary['nav_rows_extracted'] = 0
+        save_current_run_datetime()
         return
 
     if not rows:
-        print("\n👀 Processed new emails, but no NAV data was captured.")
+        append_log("\n已处理新邮件，但未捕获到基金净值数据。", "info")
+        st.session_state.run_summary['nav_rows_extracted'] = 0
         save_current_run_datetime() 
         return
 
     df = pd.DataFrame(rows, columns=COLS)
     df.drop_duplicates(inplace=True) 
+    st.session_state.run_summary['nav_rows_extracted'] = len(df)
 
     if df.empty:
-        print("\n👀 No unique NAV data captured after processing and removing duplicates.")
+        append_log("\n处理并移除重复项后，未捕获到唯一的基金净值数据。", "info")
         save_current_run_datetime() 
         return
     
-    file_exists = pathlib.Path(XLSX).exists()
-    excel_writer_mode = "a" if file_exists else "w" 
-    excel_if_sheet_exists = "replace" # Always replace if sheet exists, relevant for mode 'a'
+    st.session_state.processed_df = df
 
+    # Save to local Excel file
     try:
-        with pd.ExcelWriter(XLSX, engine="openpyxl", mode=excel_writer_mode, 
-                            if_sheet_exists=excel_if_sheet_exists) as writer:
-            # If mode='w' or file didn't exist, it creates a new file.
-            # If mode='a' and sheet exists, it's replaced.
-            # If mode='a' and sheet doesn't exist, it's added.
-            df.to_excel(writer, index=False, sheet_name=SHEET, header=True)
-        print(f"\n✅ {len(df)} unique rows written/updated → {XLSX} (Sheet: {SHEET})")
+        file_exists = pathlib.Path(XLSX).exists()
+        if file_exists:
+            with pd.ExcelWriter(XLSX, engine="openpyxl", mode="a", if_sheet_exists="replace") as writer:
+                df.to_excel(writer, index=False, sheet_name=SHEET, header=True)
+        else:
+            with pd.ExcelWriter(XLSX, engine="openpyxl", mode="w") as writer:
+                df.to_excel(writer, index=False, sheet_name=SHEET, header=True)
+        append_log(f"\n{len(df)} 行唯一数据已写入/更新至 {XLSX} (工作表: {SHEET})", "info")
     except Exception as e:
-        print(f"    ‼️ Error writing to Excel '{XLSX}': {e}.")
+        append_log(f"    写入本地Excel文件 '{XLSX}' 失败: {e}。", "error")
         timestamp_fallback = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         fallback_xlsx = f"{pathlib.Path(XLSX).stem}_fallback_{timestamp_fallback}{pathlib.Path(XLSX).suffix}"
         try:
             df.to_excel(fallback_xlsx, index=False, sheet_name=SHEET)
-            print(f"\n⚠️ Data saved to fallback file: {fallback_xlsx}")
+            append_log(f"\n数据已保存至备用文件: {fallback_xlsx}", "warning")
         except Exception as fe:
-            print(f"    ‼️ Error writing to fallback Excel file '{fallback_xlsx}': {fe}.")
-            print(f"    ℹ️ Raw data rows collected ({len(df)}):")
-            # Limiting output for very large dataframes
-            # for record_idx, record in enumerate(df.to_dict('records')):
-            #     if record_idx < 10: # Print first 10 records
-            #         print(f"      {record}")
-            #     elif record_idx == 10:
-            #         print(f"      ... (and {len(df)-10} more records)")
-            #         break
+            append_log(f"    写入备用Excel文件 '{fallback_xlsx}' 失败: {fe}。", "error")
 
+    save_current_run_datetime() 
+    append_log("\n脚本执行周期结束。", "info")
 
-    save_current_run_datetime() # Save timestamp after all processing for this run is complete
+# ─── Streamlit UI Configuration ───────────────────────────────────────
+st.set_page_config(layout="wide")
+st.title("基金净值邮件提取工具")
 
-# ─── run ────────────────────────────────────────────────────────────────
-if __name__ == "__main__":
+st.sidebar.header("配置信息")
+st.sidebar.text_input("IMAP 服务器", value=IMAP_HOST, disabled=True)
+st.sidebar.text_input("邮箱用户", value=EMAIL_USER, disabled=True) # 敏感信息
+
+st.header("运行控制与信息")
+
+last_run_ts_display = "尚未运行或未找到日志文件。"
+if LAST_RUN_FILE.exists():
     try:
-        main()
-    except KeyboardInterrupt:
-        print("\n🛑 Script interrupted by user.")
-    except Exception as e:
-        print(f"\n💥 An unexpected error occurred in main execution: {e}")
-        import traceback
-        traceback.print_exc()
-    finally:
-        # This message now prints regardless of success, interrupt, or error in main()
-        print("\n👋 Script execution cycle finished or was terminated.")
+        content = LAST_RUN_FILE.read_text().strip()
+        if content:
+            datetime.datetime.strptime(content, DATETIME_FORMAT) # 验证格式
+            last_run_ts_display = f"{content} UTC"
+    except Exception:
+        last_run_ts_display = "读取上次运行时间戳错误或格式无效。"
+st.info(f"上次成功处理记录于: **{last_run_ts_display}**")
+
+if st.button("处理新邮件", type="primary"):
+    with st.spinner("正在处理邮件... 请稍候。"):
+        run_processing()
+
+if hasattr(st.session_state, 'current_run_timestamp_display') and st.session_state.current_run_timestamp_display:
+    st.success(f"当前处理周期完成于: **{st.session_state.current_run_timestamp_display}**")
+
+st.subheader("处理摘要")
+summary = st.session_state.get('run_summary', {})
+if summary:
+    cols_summary = st.columns(3)
+    cols_summary[0].metric("发现邮件数 (服务器)", summary.get('emails_found_server', "无"))
+    cols_summary[1].metric("已分析邮件数 (新)", summary.get('emails_analyzed_count', "无"))
+    cols_summary[2].metric("提取净值行数", summary.get('nav_rows_extracted', "无"))
+    if 'error' in summary:
+        st.error(f"处理过程中发生错误: {summary['error']}")
+else:
+    st.caption("本次会话尚未开始处理，或无摘要信息。")
+
+st.subheader("提取数据")
+if st.session_state.processed_df is not None and not st.session_state.processed_df.empty:
+    st.dataframe(st.session_state.processed_df)
+    
+    output_excel = io.BytesIO()
+    with pd.ExcelWriter(output_excel, engine='openpyxl') as writer:
+        st.session_state.processed_df.to_excel(writer, index=False, sheet_name=SHEET)
+    excel_bytes = output_excel.getvalue()
+
+    st.download_button(
+        label="下载 Excel 文件",
+        data=excel_bytes,
+        file_name=XLSX,
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+elif st.session_state.processed_df is not None and st.session_state.processed_df.empty:
+    st.info("上次运行未提取到唯一的基金净值数据。")
+else:
+    st.caption("尚未处理或提取数据。请点击“处理新邮件”。")
+
+st.subheader("处理日志")
+with st.expander("显示/隐藏详细日志", expanded=False):
+    if st.session_state.processing_log:
+        for log_entry in reversed(st.session_state.processing_log):
+            if "GLM从" in log_entry and "未能从" not in log_entry :
+                 st.success(log_entry) 
+            elif "警告" in log_entry or "失败" in log_entry or "错误" in log_entry or "Error" in log_entry:
+                 st.warning(log_entry) 
+            else:
+                 st.text(log_entry)
+    else:
+        st.caption("日志为空。")
+
+# To run this:
+# 1. Save the code as a Python file (e.g., `streamlit_app_cn.py`).
+# 2. Open your terminal or command prompt.
+# 3. Navigate to the directory where you saved the file.
+# 4. Run the command: `streamlit run streamlit_app_cn.py`
