@@ -1,0 +1,7 @@
+imapclient
+pyzmail36
+pandas
+requests
+tqdm
+beautifulsoup4
+openpyxl
